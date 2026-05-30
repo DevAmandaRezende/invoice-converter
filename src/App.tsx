@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
+import { supabase } from './lib/supabase';
 import {
   Upload,
   FileSpreadsheet,
@@ -79,24 +80,27 @@ export default function App() {
     return months[new Date().getMonth()];
   });
   
-  const [exportHistory, setExportHistory] = useState<HistoryItem[]>(() => {
-    try {
-      const stored = localStorage.getItem('conversor_fiscal_history_v2');
-      return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      console.error(e);
-      return [];
-    }
-  });
+  const [exportHistory, setExportHistory] = useState<HistoryItem[]>([]);
 
-  // Save to localStorage when history changes
   useEffect(() => {
-    try {
-      localStorage.setItem('conversor_fiscal_history_v2', JSON.stringify(exportHistory));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [exportHistory]);
+    supabase
+      .from('export_history')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .then(({ data, error }) => {
+        if (error) { console.error(error); return; }
+        if (data) {
+          setExportHistory(data.map((row) => ({
+            id: row.id,
+            filename: row.filename,
+            clientName: row.client_name,
+            monthName: row.month_name,
+            timestamp: row.timestamp,
+            resultRows: row.result_rows,
+          })));
+        }
+      });
+  }, []);
 
   // Error/Success statuses
   const [alertMsg, setAlertMsg] = useState<{ type: 'success' | 'info' | 'error', text: string } | null>(null);
@@ -477,7 +481,6 @@ export default function App() {
 
       downloadSpreadsheet(filename, resultRows);
 
-      // Save to local history
       const historyItem: HistoryItem = {
         id: Math.random().toString(36).substring(2, 9),
         filename,
@@ -486,6 +489,15 @@ export default function App() {
         timestamp: new Date().toLocaleString('pt-BR'),
         resultRows
       };
+
+      supabase.from('export_history').insert({
+        id: historyItem.id,
+        filename: historyItem.filename,
+        client_name: historyItem.clientName,
+        month_name: historyItem.monthName,
+        timestamp: historyItem.timestamp,
+        result_rows: historyItem.resultRows,
+      }).then(({ error }) => { if (error) console.error(error); });
 
       setExportHistory((prev) => [historyItem, ...prev]);
 
@@ -632,6 +644,7 @@ export default function App() {
                       <button
                         onClick={() => {
                           if (confirm("Tem certeza que deseja limpar todo o histórico?")) {
+                            supabase.from('export_history').delete().neq('id', '').then(({ error }) => { if (error) console.error(error); });
                             setExportHistory([]);
                           }
                         }}
