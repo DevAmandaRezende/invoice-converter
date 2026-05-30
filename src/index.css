@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-primary: #6366F1;
+  --color-brand-accent: #8B80FF;
+  --color-brand-purple: #7C3AED;
+  --color-bg-deep: #0F0E1A;
+  --color-bg-card: #141229;
+  --color-bg-select: #1A1830;
+  --color-bg-hover: #252344;
+  --color-text-main: #F4F5FC;
+  --color-text-muted: #A1A6C4;
+  --color-border-brand: #2E2C4A;
+  --color-state-success: #22C55E;
+  --color-state-warning: #FBBF24;
+  --color-state-info: #3B82F6;
+  --color-state-danger: #FF3D00;
+}
+
+@layer base {
+  body {
+    background-color: #0F0E1A;
+    color: #F4F5FC;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+  
+  /* Scrollbar Customization */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #141229;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2E2C4A;
+    border-radius: 10px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #6366F1;
+  }
+}
+
+@layer utilities {
+  .glass {
+    background: rgba(26, 24, 48, 0.4);
+    backdrop-filter: blur(8px);
+    border: 1px solid #2E2C4A;
+  }
+  .mapping-row:hover {
+    background: rgba(99, 102, 241, 0.05);
+  }
+  .accent-glow {
+    box-shadow: 0 0 15px rgba(99, 102, 241, 0.2);
+  }
+}

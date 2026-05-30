@@ -1,0 +1,8 @@
+{
+  "name": "Conversor de Planilhas Fiscal",
+  "description": "Conversor de planilhas de vendas para o layout de importação de Notas Fiscais",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
