@@ -1,5 +1,11 @@
 import { TARGET_COLUMNS, ColumnMappingConfig, ExcelRow, TransformationType } from './types';
 
+export function sanitizeCsvValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (/^[=+\-@\t\r]/.test(value)) return `'${value}`;
+  return value;
+}
+
 // Regular expressions to assist in smart detection
 const CORRESPONDENCIA_DICIONARIO: { [key: string]: string[] } = {
   id_da_venda: ['venda', 'id', 'num', 'numero', 'codigo', 'cod_venda', 'order_id', 'id_da_venda', 'transação', 'id_compra', 'order'],

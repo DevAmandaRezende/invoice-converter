@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { supabase } from './lib/supabase';
+import type { User as SupabaseUser } from '@supabase/supabase-js';
+import AuthPage from './components/AuthPage';
 import {
   Upload,
   FileSpreadsheet,
@@ -24,7 +26,9 @@ import {
   Database,
   Grid,
   History,
-  Calendar
+  Calendar,
+  LogOut,
+  User
 } from 'lucide-react';
 import {
   TARGET_COLUMNS,
@@ -38,6 +42,7 @@ import {
   sugerirMapeamentoAutomatico,
   processarLinha,
   applyTransformation,
+  sanitizeCsvValue,
   SAMPLE_TECH_STORE_ROWS,
   SAMPLE_WEB_ACADEMY_ROWS
 } from './utils';
@@ -48,10 +53,38 @@ export interface HistoryItem {
   clientName: string;
   monthName: string;
   timestamp: string;
-  resultRows: any[];
+  filePath: string;
 }
 
 export default function App() {
+  const [user, setUser] = useState<SupabaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#0F0E1A] flex items-center justify-center">
+        <div className="h-8 w-8 border-2 border-[#6366F1] border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (!user) return <AuthPage />;
+
+  return <AppContent user={user} />;
+}
+
+function AppContent({ user }: { user: SupabaseUser }) {
   // File data state
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [uploadedColumns, setUploadedColumns] = useState<string[]>([]);
@@ -81,11 +114,27 @@ export default function App() {
   });
   
   const [exportHistory, setExportHistory] = useState<HistoryItem[]>([]);
+  const [showUserModal, setShowUserModal] = useState(false);
+  const [openHistoryMenu, setOpenHistoryMenu] = useState<string | null>(null);
+  const [menuPosition, setMenuPosition] = useState<{ top: number; right: number } | null>(null);
+  const profileName: string | null = user.user_metadata?.name ?? null;
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState('');
+  const [savingName, setSavingName] = useState(false);
+
+  const saveProfileName = async () => {
+    if (!nameInput.trim()) return;
+    setSavingName(true);
+    const { error } = await supabase.auth.updateUser({ data: { name: nameInput.trim() } });
+    setSavingName(false);
+    if (!error) setEditingName(false);
+  };
 
   useEffect(() => {
     supabase
       .from('export_history')
       .select('*')
+      .eq('user_id', user.id)
       .order('created_at', { ascending: false })
       .then(({ data, error }) => {
         if (error) { console.error(error); return; }
@@ -96,11 +145,11 @@ export default function App() {
             clientName: row.client_name,
             monthName: row.month_name,
             timestamp: row.timestamp,
-            resultRows: row.result_rows,
+            filePath: row.file_path,
           })));
         }
       });
-  }, []);
+  }, [user.id]);
 
   // Error/Success statuses
   const [alertMsg, setAlertMsg] = useState<{ type: 'success' | 'info' | 'error', text: string } | null>(null);
@@ -177,6 +226,10 @@ export default function App() {
 
   // Main workbook parser (via SheetJS)
   const parseFile = (file: File) => {
+    if (file.size > 20 * 1024 * 1024) {
+      notify('Arquivo muito grande. Limite de 20MB.', 'error');
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
@@ -425,18 +478,15 @@ export default function App() {
     );
   };
 
-  // Utility function to generate and download CSV spreadsheet
-  const downloadSpreadsheet = (filename: string, resultRows: any[]) => {
-    // Write via XLSX and convert to CSV format
+  const generateCsvBlob = (resultRows: any[]): Blob => {
     const worksheet = XLSX.utils.json_to_sheet(resultRows, {
       header: TARGET_COLUMNS.map((c) => c.key),
     });
-
-    // Generate CSV string with semicolon delimiters (Brazil standard and widely standard)
     const csvContent = XLSX.utils.sheet_to_csv(worksheet, { FS: ';' });
-    
-    // Add UTF-8 BOM so Excel and other programs recognize accented characters correctly
-    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    return new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+  };
+
+  const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -444,6 +494,19 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const redownloadFromStorage = async (item: HistoryItem) => {
+    const { data, error } = await supabase.storage.from('exports').createSignedUrl(item.filePath, 60);
+    if (error || !data) { notify('Erro ao baixar documento.', 'error'); return; }
+    const link = document.createElement('a');
+    link.href = data.signedUrl;
+    link.setAttribute('download', item.filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    notify('Planilha baixada novamente!', 'success');
   };
 
   // Export spreadsheet triggered by "Gerar Planilha"
@@ -457,53 +520,62 @@ export default function App() {
     setIsExportModalOpen(true);
   };
 
-  // Execute export when user confirms spreadsheet settings in UI
-  const confirmExport = () => {
+  const confirmExport = async () => {
     if (!clientNameInput.trim()) {
       notify("Por favor, informe o nome do cliente.", "error");
       return;
     }
 
     try {
-      // Build final rows with 22 specific headers
       const resultRows = rawRows.map((row, index) => {
         const transformedRow = processarLinha(row, mappingConfigs, index);
-        // Order keys specifically like TARGET_COLUMNS
         const orderedRow: any = {};
         TARGET_COLUMNS.forEach((col) => {
-          orderedRow[col.key] = transformedRow[col.key] || '';
+          orderedRow[col.key] = sanitizeCsvValue(transformedRow[col.key] || '');
         });
         return orderedRow;
       });
 
       const cleanClientName = clientNameInput.trim().toUpperCase();
       const filename = `Planilha de Importação- ${monthNameInput} - ${cleanClientName}.csv`;
+      const id = crypto.randomUUID();
+      const filePath = `${user.id}/${id}.csv`;
 
-      downloadSpreadsheet(filename, resultRows);
+      const blob = generateCsvBlob(resultRows);
+      downloadBlob(blob, filename);
+
+      const { error: uploadError } = await supabase.storage
+        .from('exports')
+        .upload(filePath, blob, { contentType: 'text/csv;charset=utf-8' });
+
+      if (uploadError) {
+        console.error('Storage upload error:', uploadError);
+        notify('Planilha gerada, mas erro ao salvar no histórico.', 'error');
+        return;
+      }
 
       const historyItem: HistoryItem = {
-        id: Math.random().toString(36).substring(2, 9),
+        id,
         filename,
         clientName: cleanClientName,
         monthName: monthNameInput,
         timestamp: new Date().toLocaleString('pt-BR'),
-        resultRows
+        filePath,
       };
 
       supabase.from('export_history').insert({
         id: historyItem.id,
+        user_id: user.id,
         filename: historyItem.filename,
         client_name: historyItem.clientName,
         month_name: historyItem.monthName,
         timestamp: historyItem.timestamp,
-        result_rows: historyItem.resultRows,
+        file_path: historyItem.filePath,
       }).then(({ error }) => { if (error) console.error(error); });
 
       setExportHistory((prev) => [historyItem, ...prev]);
-
-      // Feedback & close
       setIsExportModalOpen(false);
-      notify("Planilha Excel gerada e salva no histórico!", "success");
+      notify("Planilha gerada e salva no histórico!", "success");
     } catch (err) {
       console.error("Erro ao exportar:", err);
       notify("Ocorreu um erro ao estruturar o arquivo de exportação.", "error");
@@ -523,44 +595,100 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
           
           {/* Logo / Title */}
-          <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-[#7C3AED] to-[#6366F1] flex items-center justify-center shadow-lg shadow-[#7C3AED]/20">
+          <button
+            onClick={handleRemoveFile}
+            className="flex items-center gap-3 group cursor-pointer"
+            title="Voltar à tela inicial"
+          >
+            <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-[#7C3AED] to-[#6366F1] flex items-center justify-center shadow-lg shadow-[#7C3AED]/20 group-hover:shadow-[#7C3AED]/40 transition-shadow">
               <FileSpreadsheet className="h-5.5 w-5.5 text-white" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-lg font-bold tracking-tight text-[#F4F5FC]">Conversor de Planilhas Fiscal</h1>
+                <h1 className="text-lg font-bold tracking-tight text-[#F4F5FC] group-hover:text-white transition-colors">Conversor de Planilhas Fiscal</h1>
                 <span className="text-[10px] bg-[#1A1830] text-[#8B80FF] px-2 py-0.5 rounded-full border border-[#2E2C4A]">Uso Interno</span>
               </div>
             </div>
-          </div>
+          </button>
 
           {/* Action Header / Actions */}
           <div className="flex items-center gap-3">
-            {uploadedFileName && (
+            {/* User avatar */}
+            <div className="relative">
               <button
-                id="header-clear-btn"
-                onClick={handleRemoveFile}
-                className="px-3 py-1.5 text-xs font-medium text-[#A1A6C4] hover:text-white bg-[#141229] border border-[#2E2C4A] hover:border-red-500/50 rounded-lg transition-all duration-200 flex items-center gap-1.5"
+                onClick={() => setShowUserModal((v) => !v)}
+                className="flex items-center gap-2 cursor-pointer group"
+                title="Conta"
               >
-                <Trash2 className="h-3.5 w-3.5" />
-                Limpar Arquivo
+                {profileName && (
+                  <span className="text-xs font-semibold text-[#A1A6C4] group-hover:text-[#F4F5FC] transition-colors hidden sm:block">{profileName}</span>
+                )}
+                <div className="h-9 w-9 rounded-full bg-gradient-to-tr from-[#6366F1] to-[#7C3AED] flex items-center justify-center shadow-md shadow-[#6366F1]/20 group-hover:shadow-[#6366F1]/40 border-2 border-[#2E2C4A] group-hover:border-[#6366F1] transition-all">
+                  <User className="h-4.5 w-4.5 text-white" />
+                </div>
               </button>
-            )}
-            
-            <button
-              id="header-export-btn"
-              onClick={exportResult}
-              disabled={rawRows.length === 0}
-              className={`px-4 py-2 text-xs font-semibold rounded-lg shadow-md flex items-center gap-2 transition-all duration-300 ${
-                rawRows.length > 0
-                  ? 'bg-gradient-to-r from-[#6366F1] to-[#7C3AED] text-white hover:shadow-indigo-500/25 pointer-events-auto scale-102 hover:-translate-y-0.5'
-                  : 'bg-[#1A1830] text-[#A1A6C4]/50 border border-[#2E2C4A] cursor-not-allowed opacity-60'
-              }`}
-            >
-              <Download className="h-4 w-4" />
-              Exportar CSV (.csv)
-            </button>
+
+              {showUserModal && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowUserModal(false)} />
+                  <div className="absolute right-0 top-12 z-50 w-64 bg-[#141229] border border-[#2E2C4A] rounded-2xl shadow-2xl shadow-black/40 p-4 animate-in fade-in zoom-in-95 duration-150">
+                    <div className="flex flex-col items-center gap-3 pb-4 border-b border-[#2E2C4A]">
+                      <div className="h-14 w-14 rounded-full bg-gradient-to-tr from-[#6366F1] to-[#7C3AED] flex items-center justify-center shadow-lg shadow-[#6366F1]/20">
+                        <User className="h-7 w-7 text-white" />
+                      </div>
+                      <div className="text-center w-full">
+                        {editingName ? (
+                          <div className="flex items-center gap-1.5 mt-1">
+                            <input
+                              autoFocus
+                              value={nameInput}
+                              onChange={(e) => setNameInput(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') saveProfileName(); if (e.key === 'Escape') setEditingName(false); }}
+                              placeholder="Seu nome"
+                              className="flex-1 bg-[#0F0E1A] border border-[#6366F1] rounded-lg px-2 py-1 text-xs text-[#F4F5FC] outline-none w-full"
+                            />
+                            <button
+                              onClick={saveProfileName}
+                              disabled={savingName || !nameInput.trim()}
+                              className="px-2 py-1 bg-[#6366F1] text-white text-[10px] font-bold rounded-lg disabled:opacity-50 cursor-pointer"
+                            >
+                              {savingName ? '...' : 'OK'}
+                            </button>
+                            <button
+                              onClick={() => setEditingName(false)}
+                              className="px-2 py-1 bg-[#1A1830] text-[#A1A6C4] text-[10px] rounded-lg cursor-pointer border border-[#2E2C4A]"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-center gap-1.5">
+                            <p className="text-sm font-bold text-[#F4F5FC]">
+                              {profileName ?? 'Sem nome'}
+                            </p>
+                            <button
+                              onClick={() => { setNameInput(profileName ?? ''); setEditingName(true); }}
+                              className="text-[#A1A6C4] hover:text-[#8B80FF] transition-colors cursor-pointer"
+                              title="Editar nome"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            </button>
+                          </div>
+                        )}
+                        <p className="text-[11px] text-[#A1A6C4] break-all mt-0.5">{user.email}</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => { setShowUserModal(false); supabase.auth.signOut(); }}
+                      className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2 bg-[#1A1830] hover:bg-red-500/10 text-[#A1A6C4] hover:text-red-400 border border-[#2E2C4A] hover:border-red-500/40 rounded-xl text-xs font-semibold transition-all cursor-pointer"
+                    >
+                      <LogOut className="h-3.5 w-3.5" />
+                      Sair da Conta
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -644,7 +772,7 @@ export default function App() {
                       <button
                         onClick={() => {
                           if (confirm("Tem certeza que deseja limpar todo o histórico?")) {
-                            supabase.from('export_history').delete().neq('id', '').then(({ error }) => { if (error) console.error(error); });
+                            supabase.from('export_history').delete().eq('user_id', user.id).then(({ error }) => { if (error) console.error(error); });
                             setExportHistory([]);
                           }
                         }}
@@ -677,18 +805,20 @@ export default function App() {
                             </div>
                           </div>
                           <button
-                            onClick={() => {
-                              try {
-                                downloadSpreadsheet(item.filename, item.resultRows);
-                                notify("Planilha baixada novamente!", "success");
-                              } catch (e) {
-                                notify("Erro ao baixar documento.", "error");
+                            onClick={(e) => {
+                              if (openHistoryMenu === item.id) {
+                                setOpenHistoryMenu(null);
+                                setMenuPosition(null);
+                              } else {
+                                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                setMenuPosition({ top: rect.bottom + 6, right: window.innerWidth - rect.right });
+                                setOpenHistoryMenu(item.id);
                               }
                             }}
-                            className="p-1.5 bg-[#1A1830] hover:bg-[#6366F1] text-[#8B80FF] hover:text-white rounded-lg border border-[#2E2C4A] group-hover:border-[#6366F1]/30 transition-all cursor-pointer shrink-0"
-                            title="Exportar novamente"
+                            className="p-1.5 bg-[#1A1830] hover:bg-[#252344] text-[#A1A6C4] hover:text-white rounded-lg border border-[#2E2C4A] transition-all cursor-pointer shrink-0"
+                            title="Opções"
                           >
-                            <Download className="h-3.5 w-3.5" />
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
                           </button>
                         </div>
                       ))}
@@ -696,12 +826,6 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="bg-[#1A1830]/80 border border-[#2E2C4A] p-2.5 rounded-xl mt-4">
-                  <div className="flex items-center gap-2 text-[10px] text-[#A1A6C4] leading-relaxed">
-                    <CheckCircle2 className="h-3.5 w-3.5 text-[#22C55E] shrink-0" />
-                    <span>Seus arquivos exportados ficam salvos localmente neste navegador de forma segura.</span>
-                  </div>
-                </div>
               </div>
 
             </div>
@@ -750,55 +874,10 @@ export default function App() {
             </div>
 
             {/* Conversion Settings Panel */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-              
-              {/* SIDEBAR WORKFLOW PROGRESS (3-columns on lg) */}
-              <div className="col-span-1 lg:col-span-3 space-y-6">
-                
-                {/* Visual step guide */}
-                <div className="glass rounded-2xl p-5 border border-[#2E2C4A] space-y-4">
-                  <h4 className="text-[10px] font-bold text-[#A1A6C4] uppercase tracking-wider">Etapas de Trabalho</h4>
-                  
-                  <div className="space-y-4">
-                    {/* Step 1: Loaded */}
-                    <div className="flex items-center gap-3">
-                      <div className="h-6 w-6 rounded-full bg-[#22C55E]/10 border border-[#22C55E]/30 flex items-center justify-center shrink-0">
-                        <Check className="h-3.5 w-3.5 text-[#22C55E]" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-xs font-bold text-[#F4F5FC]">1. Importar Planilha</div>
-                        <div className="text-[9px] text-[#A1A6C4] truncate max-w-[150px]">{uploadedFileName}</div>
-                      </div>
-                    </div>
-                    
-                    {/* Step 2: Mapping */}
-                    <div className="flex items-center gap-3">
-                      <div className="h-6 w-6 rounded-full bg-[#6366F1]/15 border border-[#6366F1]/60 flex items-center justify-center shrink-0 font-mono text-[10px] font-bold text-[#8B80FF]">
-                        2
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-[#F4F5FC]">2. Mapeamento Fiscal</div>
-                        <div className="text-[9px] text-[#8B80FF]">Ajustando as colunas</div>
-                      </div>
-                    </div>
-                    
-                    {/* Step 3: Finish */}
-                    <div className="flex items-center gap-3">
-                      <div className="h-6 w-6 rounded-full bg-[#1A1830] border border-[#2E2C4A] flex items-center justify-center shrink-0 font-mono text-[10px] text-[#A1A6C4]">
-                        3
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-[#A1A6C4]">3. Exportação Pronta</div>
-                        <div className="text-[9px] text-[#A1A6C4]">{rawRows.length} linhas para faturamento</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
+            <div className="grid grid-cols-1 gap-8 items-start">
 
-              </div>
-
-              {/* MAPPING WORKSPACE PANELS AND FORMS (9-columns on lg) */}
-              <div className="col-span-1 lg:col-span-9 bg-[#141229] border border-[#2E2C4A] rounded-3xl p-6 flex flex-col justify-between">
+              {/* MAPPING WORKSPACE PANELS AND FORMS */}
+              <div className="bg-[#141229] border border-[#2E2C4A] rounded-3xl p-6 flex flex-col justify-between">
                 
                 {/* Panel Header */}
                 <div>
@@ -1226,100 +1305,162 @@ export default function App() {
 
       {/* Export Confirmation Modal */}
       {isExportModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-250">
-          <div className="bg-[#141229] border border-[#2E2C4A] w-full max-w-md rounded-3xl p-6 shadow-2xl relative animate-in zoom-in duration-200">
-            
-            {/* Header */}
-            <div className="flex items-center justify-between mb-4 pb-2 border-b border-[#2E2C4A]/40">
-              <div className="flex items-center gap-2">
-                <FileSpreadsheet className="h-5 w-5 text-[#8B80FF]" />
-                <h3 className="text-sm font-bold text-[#F4F5FC] uppercase tracking-wider">Configurar Exportação</h3>
-              </div>
-              <button
-                onClick={() => setIsExportModalOpen(false)}
-                className="text-[#A1A6C4] hover:text-white transition-colors text-xl font-bold cursor-pointer"
-              >
-                &times;
-              </button>
-            </div>
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center sm:p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-[#0F0E1A] w-full sm:max-w-lg rounded-t-3xl sm:rounded-3xl shadow-2xl relative animate-in slide-in-from-bottom-4 sm:zoom-in-95 duration-200 overflow-hidden">
 
-            {/* Description */}
-            <p className="text-xs text-[#A1A6C4] leading-relaxed mb-5">
-              Defina os parâmetros para gerar o arquivo padronizado no formato: <strong className="text-[#F4F5FC]">Planilha de Importação- mês - NOME DO CLIENTE</strong>.
-            </p>
+            {/* Top accent bar */}
+            <div className="h-1 w-full bg-gradient-to-r from-[#6366F1] to-[#7C3AED]" />
 
-            {/* Form Fields */}
-            <div className="space-y-4 mb-6">
-              <div>
-                <label className="block text-xs font-semibold text-[#A1A6C4] mb-1.5">
-                  Nome do Cliente <span className="text-red-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={clientNameInput}
-                  onChange={(e) => setClientNameInput(e.target.value)}
-                  placeholder="EX: TECHSTORE ACADEMY"
-                  className="w-full text-xs bg-[#0F0E1A] border border-[#2E2C4A] focus:border-[#6366F1] rounded-xl px-3 py-2.5 outline-none font-semibold text-[#F4F5FC] uppercase placeholder:text-gray-600 transition-colors"
-                  autoFocus
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-[#A1A6C4] mb-1.5">
-                  Mês de Referência
-                </label>
-                <select
-                  value={monthNameInput}
-                  onChange={(e) => setMonthNameInput(e.target.value)}
-                  className="w-full text-xs bg-[#0F0E1A] border border-[#2E2C4A] focus:border-[#6366F1] rounded-xl px-3 py-2.5 outline-none font-semibold text-[#F4F5FC] cursor-pointer transition-colors"
+            <div className="p-6">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="h-9 w-9 rounded-xl bg-[#6366F1]/15 border border-[#6366F1]/30 flex items-center justify-center">
+                    <Download className="h-4 w-4 text-[#8B80FF]" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-[#F4F5FC]">Exportar Planilha</h3>
+                    <p className="text-[11px] text-[#A1A6C4]">{rawRows.length} linhas prontas para exportação</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsExportModalOpen(false)}
+                  className="h-8 w-8 flex items-center justify-center rounded-lg bg-[#1A1830] border border-[#2E2C4A] text-[#A1A6C4] hover:text-white transition-colors cursor-pointer text-lg leading-none"
                 >
-                  {[
-                    'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
-                    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
-                  ].map((month) => (
-                    <option key={month} value={month} className="bg-[#141229] font-medium text-white">
-                      {month}
-                    </option>
-                  ))}
-                </select>
+                  &times;
+                </button>
               </div>
-            </div>
 
-            {/* File Preview Label */}
-            {clientNameInput.trim() && (
-              <div className="bg-[#1A1830] border border-[#2E2C4A] rounded-xl p-3 mb-6">
-                <span className="block text-[10px] text-[#A1A6C4] font-semibold uppercase tracking-wider mb-1">
-                  Nome Final Recomendado do Arquivo:
-                </span>
-                <code className="text-xs font-mono text-[#8B80FF] overflow-wrap-anywhere break-all">
-                  Planilha de Importação- {monthNameInput} - {clientNameInput.trim().toUpperCase()}.csv
+              {/* Form — side by side on wider screens */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                <div className="bg-[#141229] border border-[#2E2C4A] rounded-2xl p-4">
+                  <label className="block text-[10px] font-bold text-[#A1A6C4] uppercase tracking-wider mb-2">
+                    Nome do Cliente <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={clientNameInput}
+                    onChange={(e) => setClientNameInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && clientNameInput.trim()) confirmExport(); }}
+                    placeholder="Ex: TECHSTORE"
+                    className="w-full text-sm bg-[#0F0E1A] border border-[#2E2C4A] focus:border-[#6366F1] rounded-xl px-3 py-2 outline-none font-semibold text-[#F4F5FC] uppercase placeholder:text-[#A1A6C4]/20 transition-colors"
+                    autoFocus
+                  />
+                </div>
+
+                <div className="bg-[#141229] border border-[#2E2C4A] rounded-2xl p-4">
+                  <label className="block text-[10px] font-bold text-[#A1A6C4] uppercase tracking-wider mb-2">
+                    Mês de Referência
+                  </label>
+                  <select
+                    value={monthNameInput}
+                    onChange={(e) => setMonthNameInput(e.target.value)}
+                    className="w-full text-sm bg-[#0F0E1A] border border-[#2E2C4A] focus:border-[#6366F1] rounded-xl px-3 py-2 outline-none font-semibold text-[#F4F5FC] cursor-pointer transition-colors"
+                  >
+                    {[
+                      'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+                      'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
+                    ].map((month) => (
+                      <option key={month} value={month} className="bg-[#141229] font-medium text-white">
+                        {month}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* File name preview */}
+              <div className={`rounded-2xl border px-4 py-3 mb-6 transition-all duration-200 ${clientNameInput.trim() ? 'bg-[#6366F1]/5 border-[#6366F1]/30' : 'bg-[#141229] border-[#2E2C4A]'}`}>
+                <p className="text-[10px] font-bold text-[#A1A6C4] uppercase tracking-wider mb-1">Arquivo gerado</p>
+                <code className="text-xs font-mono text-[#8B80FF] break-all">
+                  {clientNameInput.trim()
+                    ? `Planilha de Importação- ${monthNameInput} - ${clientNameInput.trim().toUpperCase()}.csv`
+                    : <span className="text-[#A1A6C4]/40 italic">Preencha o nome do cliente...</span>
+                  }
                 </code>
               </div>
-            )}
 
-            {/* Action Buttons */}
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => setIsExportModalOpen(false)}
-                className="flex-1 px-4 py-2.5 bg-[#1A1830] hover:bg-[#252344] text-[#A1A6C4] font-bold text-xs rounded-xl border border-[#2E2C4A] transition-colors cursor-pointer"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={confirmExport}
-                disabled={!clientNameInput.trim()}
-                className={`flex-1 px-4 py-2.5 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                  clientNameInput.trim()
-                    ? 'bg-[#6366F1] hover:bg-[#7C3AED] text-white shadow shadow-indigo-500/20'
-                    : 'bg-[#1E1C38] text-gray-500 cursor-not-allowed border border-[#2E2C4A]/40'
-                }`}
-              >
-                <Download className="h-4 w-4" />
-                Exportar Planilha
-              </button>
+              {/* Action Buttons */}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setIsExportModalOpen(false)}
+                  className="px-5 py-2.5 bg-[#141229] hover:bg-[#1A1830] text-[#A1A6C4] font-bold text-xs rounded-xl border border-[#2E2C4A] transition-colors cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={confirmExport}
+                  disabled={!clientNameInput.trim()}
+                  className={`flex-1 px-4 py-2.5 text-sm font-bold rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                    clientNameInput.trim()
+                      ? 'bg-gradient-to-r from-[#6366F1] to-[#7C3AED] text-white shadow-lg shadow-indigo-500/20 hover:shadow-indigo-500/40 hover:-translate-y-0.5'
+                      : 'bg-[#1A1830] text-[#A1A6C4]/40 cursor-not-allowed border border-[#2E2C4A]'
+                  }`}
+                >
+                  <Download className="h-4 w-4" />
+                  Gerar e Baixar CSV
+                </button>
+              </div>
             </div>
 
           </div>
+        </div>
+      )}
+
+      {/* History item context menu */}
+      {openHistoryMenu && menuPosition && (() => {
+        const item = exportHistory.find((h) => h.id === openHistoryMenu);
+        if (!item) return null;
+        return (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => { setOpenHistoryMenu(null); setMenuPosition(null); }} />
+            <div
+              className="fixed z-50 w-44 bg-[#141229] border border-[#2E2C4A] rounded-xl shadow-2xl shadow-black/40 overflow-hidden"
+              style={{ top: menuPosition.top, right: menuPosition.right }}
+            >
+              <button
+                onClick={() => { setOpenHistoryMenu(null); setMenuPosition(null); redownloadFromStorage(item); }}
+                className="w-full flex items-center gap-2.5 px-3 py-2.5 text-xs text-[#F4F5FC] hover:bg-[#1A1830] transition-colors cursor-pointer"
+              >
+                <Download className="h-3.5 w-3.5 text-[#8B80FF]" />
+                Baixar arquivo
+              </button>
+              <div className="h-px bg-[#2E2C4A]" />
+              <button
+                onClick={async () => {
+                  setOpenHistoryMenu(null);
+                  setMenuPosition(null);
+                  await supabase.storage.from('exports').remove([item.filePath]);
+                  await supabase.from('export_history').delete().eq('id', item.id);
+                  setExportHistory((prev) => prev.filter((h) => h.id !== item.id));
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-2.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Excluir
+              </button>
+            </div>
+          </>
+        );
+      })()}
+
+      {/* Floating action buttons */}
+      {rawRows.length > 0 && (
+        <div className="fixed bottom-6 right-6 z-40 flex items-center gap-2">
+          <button
+            onClick={handleRemoveFile}
+            className="flex items-center gap-2 px-4 py-3 bg-[#141229] border border-[#2E2C4A] hover:border-red-500/50 text-[#A1A6C4] hover:text-red-400 text-sm font-bold rounded-2xl shadow-xl shadow-black/20 hover:-translate-y-0.5 transition-all duration-200"
+          >
+            <Trash2 className="h-4 w-4" />
+            Limpar
+          </button>
+          <button
+            onClick={exportResult}
+            className="flex items-center gap-2.5 px-5 py-3 bg-gradient-to-r from-[#6366F1] to-[#7C3AED] text-white text-sm font-bold rounded-2xl shadow-xl shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5 transition-all duration-200"
+          >
+            <Download className="h-4 w-4" />
+            Exportar CSV
+          </button>
         </div>
       )}
 
